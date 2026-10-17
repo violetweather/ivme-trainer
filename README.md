@@ -1,27 +1,470 @@
-# IVME trainer — a reverse-engineering writeup
+# IVME-ADV-2026-001 — Client-side movement state is externally writable (speed, jump, fly, noclip)
 
-An external movement trainer for **IVME v0.17.10.0** ("Never Stop Moving",
-Godot 4.7, DDPWorks), and the story of how it was built.
+> **Unofficial advisory.** This is a personal research writeup in the style
+> of a CVE entry. No CVE has been requested or assigned. Not affiliated with
+> DDPWorks. No game code or assets are included in this repository.
 
-It is pure Python (stdlib `ctypes` only). No game files are modified and
-nothing is injected: it opens `ivme.exe` with `ReadProcessMemory` /
-`WriteProcessMemory` and edits values in RAM.
-
-**Features:** speed preset · jump preset · fly · noclip · adjustable
-intensity · one-key restore.
-
-> **Offline / practice only.** IVME re-simulates every public run from your
-> recorded inputs with stock movement data. Anything this trainer changes
-> will desync that check. See [Public runs](#public-runs-and-anti-cheat).
+| Field | Value |
+| --- | --- |
+| **Advisory ID** | IVME-ADV-2026-001 (unofficial) |
+| **Product** | IVME ("Never Stop Moving"), DDPWorks |
+| **Affected version** | 0.17.10.0 (Steam, Windows x64). Other versions not tested. |
+| **Engine** | Godot 4.7 (`template_debug` build) |
+| **Component** | `PlayerMovementData` resource, `PlayerController` / `PlayerBody` scripts, `MovementModel` |
+| **Weakness** | [CWE-602](https://cwe.mitre.org/data/definitions/602.html) Client-Side Enforcement of Server-Side Security · [CWE-471](https://cwe.mitre.org/data/definitions/471.html) Modification of Assumed-Immutable Data · [CWE-345](https://cwe.mitre.org/data/definitions/345.html) Insufficient Verification of Data Authenticity (F-4) |
+| **CVSS v3.1** | **3.3 Low** — `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:N` |
+| **Attack type** | Local, same-user process memory read/write (`ReadProcessMemory` / `WriteProcessMemory`) |
+| **Mitigated by** | Headless replay verifier shipped in the game — partly; see [§7](#7-existing-mitigations) and [F-4](#f-4-replay-verifier-snaps-instead-of-failing-on-moderate-drift) |
+| **Reported** | Not reported. Private research. |
+| **Date** | 2026-10-17 |
+| **Researcher** | [@violetweather](https://github.com/violetweather) |
 
 ---
 
-## Quick start
+## Contents
 
-Start the game and load into a level, then:
+1. [Summary](#1-summary)
+2. [Severity rationale](#2-severity-rationale)
+3. [Background](#3-background)
+4. [Findings](#4-findings)
+   - [F-1 Movement tuning is a mutable, signature-discoverable heap array](#f-1-movement-tuning-is-a-mutable-signature-discoverable-heap-array)
+   - [F-2 Collision can be removed through a per-tick re-applied script variable (noclip)](#f-2-collision-can-be-removed-through-a-per-tick-re-applied-script-variable-noclip)
+   - [F-3 Vertical velocity can be overridden in state and body (fly)](#f-3-vertical-velocity-can-be-overridden-in-state-and-body-fly)
+   - [F-4 Replay verifier snaps instead of failing on moderate drift](#f-4-replay-verifier-snaps-instead-of-failing-on-moderate-drift)
+   - [N-1 Negative result: writing `CollisionShape3D.disabled` has no effect](#n-1-negative-result-writing-collisionshape3ddisabled-has-no-effect)
+5. [Proof of concept](#5-proof-of-concept)
+6. [Impact](#6-impact)
+7. [Existing mitigations](#7-existing-mitigations)
+8. [Recommendations](#8-recommendations)
+9. [Research method](#9-research-method)
+10. [Test environment and evidence](#10-test-environment-and-evidence)
+11. [Limitations](#11-limitations)
+12. [Timeline](#12-timeline)
+13. [Using the PoC trainer](#13-using-the-poc-trainer)
+14. [Files](#14-files)
+
+---
+
+## 1. Summary
+
+IVME keeps all player movement tuning, the collision-shape offset, and the
+player velocity in ordinary writable heap memory, with no client-side
+integrity check. A local process running as the same user can:
+
+* find the 54-field movement-tuning array with a value signature (no static
+  offsets), and change speed, acceleration, jump, gravity and bhop caps;
+* move the player's collision shape 1000 units away by writing one script
+  variable that the game itself re-applies every physics tick (**noclip**);
+* hold the vertical velocity at any value by writing it in both the movement
+  state and the native `CharacterBody3D` (**fly**).
+
+All changes take effect on the next 120 Hz physics tick and are fully
+reversible. No game files are changed and no code is injected.
+
+The direct effect is **local**. The game already ships a headless replay
+verifier that re-simulates recorded inputs with stock data. It rejects
+large deviations. However, it corrects moderate drift by snapping the player
+back onto the recording instead of failing (F-4), so it gives less
+protection than a strict replay check would. This advisory does not test or
+attempt any bypass of that verifier or of the Certael attestation layer. No
+run was submitted.
+
+## 2. Severity rationale
+
+| Metric | Value | Why |
+| --- | --- | --- |
+| Attack Vector | Local (L) | Needs code running on the player's own PC. |
+| Attack Complexity | Low (L) | Signature scan + plain memory writes. No race to win, no special conditions. |
+| Privileges Required | Low (L) | Same user as the game. Administrator only if the process handle is restricted. |
+| User Interaction | None (N) | — |
+| Scope | Unchanged (U) | Only the game process is affected. |
+| Confidentiality | None (N) | No data is disclosed. |
+| Integrity | Low (L) | The player's own simulation is changed. Public results are partly protected by the replay verifier (F-4). |
+| Availability | None (N) | The game kept running normally in every test. |
+
+Base score **3.3 (Low)**. Large changes (noclip through walls, fast fly)
+produce drift far beyond the verifier's abort limit. How much smaller
+changes could pass under F-4 was **not** tested. It also depends on the
+backend running the verifier at all, which is an assumption — see
+[§11](#11-limitations).
+
+## 3. Background
+
+**Godot `Variant`.** GDScript stores every script variable as a `Variant`.
+On x86_64 a `Variant` is 24 bytes: a 4-byte type id at `+0`, padding, then
+the payload at `+8`. A `FLOAT` (type 3) holds a `double`. A `Vector3`
+(type 9) holds three `float`s. An `OBJECT` (type 24) holds an `ObjectID` at
+`+8` and an `Object*` at `+16`.
+
+**Script instances.** A `GDScriptInstance` keeps its variables as one
+contiguous `Variant[]`, in declaration order (inherited classes first). So a
+script's variables are a predictable, typed block of memory.
+
+**IVME's movement pipeline** (decompiled from `ivme.pck`):
+
+* `res://scripts/player/player_movement_data.tres` — `PlayerMovementData`, 54
+  tuning variables (`max_speed=5.0`, `accel=20`, `air_accel=20`,
+  `friction=8`, `jump_velocity=4`, `gravity_scale_base=1.2`,
+  `air_speed_cap_multiplier=1.03`, `per_bhop_cap_increase=1`,
+  `max_air_cap_bonus=5`, `base_fov=95`, …). Full table:
+  [`movement_data.json`](movement_data.json).
+* `PlayerController.do_movement()` runs every physics tick at
+  `BASE_PHYSICS_FPS = 120`:
+
+  ```gdscript
+  _movement_state.velocity = velocity          # native body -> state
+  var pre := _movement_model.pre_move(_movement_state, self, cam, delta, _locomotion_fsm)
+  ...
+  velocity = _movement_state.velocity          # state -> native body
+  move_and_slide()
+  _movement_state.velocity = velocity
+  _movement_model.post_move(_movement_state, self, cam, delta, now_on_floor, slide_held)
+  velocity = _movement_state.velocity
+  ```
+
+* `MovementModel._handle_slide_crouch()` runs inside `pre_move` and, when the
+  player is not sliding, does:
+
+  ```gdscript
+  body.col_shape.shape.height = body._original_col_height
+  body.col_shape.position.y = body._original_col_pos_y
+  ```
+
+## 4. Findings
+
+### F-1 Movement tuning is a mutable, signature-discoverable heap array
+
+**Description.** The 54 `PlayerMovementData` variables live as a
+`Variant[54]` on the default heap. The game keeps several live copies (the
+cached resource, the local player's `PlayerController`, which inherits the
+fields, replay ghosts, menu instances). Every copy is writable and none is
+checked for changes. The movement model reads its constants from these
+copies every tick.
+
+**Locating it.** The stock values form a distinctive pattern of doubles:
+
+1. Enumerate committed `MEM_PRIVATE` pages with `PAGE_READWRITE`,
+   `PAGE_WRITECOPY` or `PAGE_EXECUTE_READWRITE` (the default heap). Skipping
+   image and mapped regions brings a multi-GB scan down to about 2–3 s.
+2. Search for the double `95.0` (`base_fov`, field 34) as an anchor. No
+   preset changes this field.
+3. Step back `34 × 24 + 8` bytes to the array start and check 24 signature
+   slots: each must be type `FLOAT`, finite, and `|v| ≤ 1000`, and at least
+   16 must equal stock. The "≥ 16" rule keeps rescans working while values
+   are already changed.
+
+**Write primitive.** Write a little-endian `double` to
+`array + index × 24 + 8`, for every live copy, then read it back.
+
+**Effect.** Changes take effect on the next tick: speed caps, ground and air
+acceleration, bhop cap growth, jump height, gravity, walljump force, slide
+behaviour.
+
+**Hazard found during research.** Copies are freed and their memory reused
+as levels and players load. A cached address can later hold unrelated data.
+The PoC re-validates the full signature right before every read and write,
+so it never writes into recycled memory.
+
+### F-2 Collision can be removed through a per-tick re-applied script variable (noclip)
+
+**Description.** `PlayerController` instances extend the movement fields with
+runtime state. In 0.17.10.0 the instance holds 94 variables with a fixed
+type layout (used as a second signature). Relevant slots:
+
+| Slot | Variable | Type |
+| --- | --- | --- |
+| 55 | `_original_col_pos_y` | `FLOAT` (stock `0.0`) |
+| 57 | `can_move` | `BOOL` |
+| 59 | `input_locked` | `BOOL` |
+| 76 | `is_replay` | `BOOL` |
+| 84 | `col_shape` | `OBJECT` → `CollisionShape3D` |
+| 87 | `_movement_state` | `OBJECT` → `PlayerMovementState` |
+
+`_handle_slide_crouch()` assigns `col_shape.position.y =
+_original_col_pos_y` **through the property setter** on every tick in which
+the player is not sliding. The game treats `_original_col_pos_y` as a
+constant captured at spawn, but it is never checked.
+
+**Write primitive.** Write `1000.0` to slot 55 of the local, non-replay
+`PlayerController`. On the next tick the game itself moves the collision
+shape 1000 units above the body, into empty sky. The body then collides with
+nothing. To undo it, write back the original value, which is captured before
+the first write.
+
+**Why this works when a direct write does not:** the setter notifies the
+physics server. See N-1.
+
+### F-3 Vertical velocity can be overridden in state and body (fly)
+
+**Description.** `PlayerMovementState.velocity` (state variable slot 0,
+`Vector3`) and the native `CharacterBody3D::velocity` are both plain memory.
+They are copied into each other several times per tick (see
+[§3](#3-background)).
+
+**Pointer chain** (offsets for this exact `template_debug` build):
+
+```
+PlayerController Variant[87]  -> Object* movement_state   (+16 in the Variant)
+movement_state + 0x68         -> GDScriptInstance*
+instance       + 0x50         -> Variant[] members        (slot 0 = velocity)
+
+PlayerController Variant[84]  -> Object* col_shape        (+16 in the Variant)
+col_shape      + 0x100        -> Node* parent = CharacterBody3D
+body           + 0x550        -> Vector3 velocity (3 × f32)
+```
+
+Every link is checked before use: heap range, 8-byte alignment, a vtable
+pointer in the executable's range, and the expected variant type layout.
+
+**Write primitive.** With gravity set to 0 (F-1:
+`gravity_scale_base = gravity_scale_max = 0`), write the target Y velocity
+as one `float` at `+4` in **both** the state velocity and the native body
+velocity.
+
+**Two problems found and fixed during research:**
+
+1. *State-only writes are lost.* `do_movement()` starts with
+   `_movement_state.velocity = velocity`, so the native value overwrites the
+   state at the start of each tick. Writing both places fixes this.
+2. *Timing.* Physics runs at 120 Hz (every ~8.3 ms), and the game sets the
+   velocity again on each tick. At a 50 ms write interval most ticks used the
+   game's own value. At about 4 ms almost every tick uses the target
+   (measured below). Only the Y float is written, so a tick that lands
+   between our read and write cannot have its horizontal velocity replaced
+   with an old value.
+
+| Write interval | Samples at target Y velocity (state **and** body, ±0.5) |
+| --- | --- |
+| 50 ms | 0/20 (↑), 1/20 (↓) — 0–5 % |
+| 4 ms | 101/101 (↑), 100/101 (↓) — 99–100 % |
+
+**Choosing the right instance.** Several non-replay `PlayerController`
+instances can exist at once and look the same (`can_move = true`). Only the
+simulating one advances `PlayerMovementState.physics_time` (state slot 1).
+The PoC samples it twice and drives only the instance whose value moves. It
+re-checks this every 2 s and re-acquires all pointers after a level load.
+
+### F-4 Replay verifier snaps instead of failing on moderate drift
+
+**Description.** In `--verify` mode, `headless_verifier.gd` compares the
+re-simulated position to the recorded keyframe only once every 120 ticks
+(1 s):
+
+```gdscript
+if current_frame_index > 0 and current_frame_index % 120 == 0:
+    var kf = keyframes[current_frame_index / KEYFRAME_INTERVAL]
+    var dist = player_node.global_position.distance_to(kf.pos)
+    if dist > DESYNC_ABORT_TOLERANCE:          # 5.0
+        printerr("VERIFICATION_FAILED: Desync ...")
+        get_tree().quit(1)
+    elif dist > DESYNC_SNAP_TOLERANCE:         # 0.05
+        player_node.global_position = kf.pos   # accept the recording
+        player_node.velocity = kf.vel
+```
+
+When the re-simulation drifts between 0.05 m and 5.0 m in a one-second
+window, the verifier does not fail. It moves the simulated player to the
+**recorded** position and velocity and goes on. The end check only needs the
+final position within `FINAL_POSITION_TOLERANCE = 2.0` of the last keyframe.
+
+**Why it matters.** The snap is there to absorb harmless float and
+frame-timing differences between machines. But it also means the recorded
+keyframes, which come from the client, are trusted after each snap. So the
+verifier detects how far each second drifts, not whether the whole path
+was possible with stock movement. The `--validate` bounds
+(`MAX_VALIDATE_H_SPEED = 24`, `MAX_VALIDATE_V_SPEED = 30`,
+`TELEPORT_DISTANCE = 2.0` per keyframe) are much looser than stock
+movement (`max_speed = 5.0`).
+
+**Status.** Found by reading the code only. Not tested against a real
+submission. Whether specific F-1/F-3 changes stay under the limits was not
+measured, on purpose.
+
+### N-1 Negative result: writing `CollisionShape3D.disabled` has no effect
+
+The obvious way to do noclip is to set the shape's native `disabled` flag
+in memory. A controlled probe (a small Godot project running under a copy of
+the same `ivme.exe`) showed that this changes the node's field but **not**
+the physics server's copy. The body stayed on the floor with
+`disabled = true`. Only setter calls (`set_disabled`, `set_position`, …)
+reach the physics server. F-2 works because the game makes that setter call
+itself.
+
+## 5. Proof of concept
+
+The PoC is [`ivme_trainer.py`](ivme_trainer.py): Python 3.10+, stdlib
+`ctypes` only.
+
+```text
+1. OpenProcess(VM_READ | VM_WRITE | VM_OPERATION | QUERY_INFORMATION, ivme.exe)
+2. Scan heap pages for the PlayerMovementData signature            (F-1)
+3. Write tuning doubles to every live copy; read back to verify     (F-1)
+4. Filter hits with the 94-slot PlayerController type layout
+5. Follow col_shape / _movement_state / parent pointers, check each (F-2, F-3)
+6. noclip: slot 55 := 1000.0                                        (F-2)
+7. fly:    gravity := 0; every ~4 ms write vel.y to state + body    (F-3)
+8. restore: stock values, slot 55 := captured original              (all)
+```
+
+Reproduce (game running, loaded into a level):
 
 ```powershell
-python ivme_trainer.py                      # interactive hotkey mode
+python ivme_trainer.py --scan-only            # F-1: arrays + players found, values printed
+python ivme_trainer.py --set max_speed=7.5    # F-1: "OK" after read-back verify
+python ivme_trainer.py --noclip               # F-2: fall through the floor
+python ivme_trainer.py --fly                  # F-3: hold Space to rise, C to sink
+python ivme_trainer.py --restore              # everything back to stock
+```
+
+## 6. Impact
+
+* **Local player:** full control over movement tuning, collision and
+  vertical velocity. Useful for practice, route finding and learning the
+  movement model at other settings.
+* **Other players / leaderboards:** reduced but not zero. Large changes
+  drift past the 5 m-per-second abort limit and fail. Moderate drift is
+  snapped back and accepted (F-4). Whether this is enough for a run with
+  changed tuning to pass was not tested.
+* **Stability:** none observed. The game stayed responsive in every live
+  test. Freed-memory reuse (F-1) would be a crash risk for a careless tool.
+  The PoC guards against it.
+
+## 7. Existing mitigations
+
+The game ships checks meant to run on the backend. They catch large
+changes. F-4 describes where they are weaker.
+
+**`scripts/headless_verifier.gd`** (shipped in the client and run as
+`ivme.exe --headless -- --verify|--validate <ghost>`):
+
+| Constant | Value | Role |
+| --- | --- | --- |
+| `BASE_PHYSICS_FPS` | 120 | simulation rate |
+| `KEYFRAME_INTERVAL` | 6 | ticks between recorded keyframes |
+| `DESYNC_SNAP_TOLERANCE` | 0.05 | re-simulation vs recorded keyframe |
+| `DESYNC_ABORT_TOLERANCE` | 5.0 | abort when re-simulation drifts this far |
+| `FINAL_POSITION_TOLERANCE` | 2.0 | end position must match |
+| `MAX_VALIDATE_H_SPEED` | 24.0 | horizontal speed bound |
+| `MAX_VALIDATE_V_SPEED` | 30.0 | vertical speed bound |
+| `TELEPORT_DISTANCE` | 2.0 | max movement between keyframes |
+| `RACE_TIME_TOLERANCE_MS` | 2000 | reported time vs tick count |
+
+* `--verify` replays the recorded **inputs** through the stock movement code
+  and, every 120 ticks, compares the result to the recorded keyframe. Drift
+  over 5.0 m fails the run. Drift between 0.05 m and 5.0 m is snapped back
+  onto the recording (F-4). The final position must be within 2.0 m.
+* `--validate` checks the ghost data alone for impossible values (teleports,
+  speed bounds, time consistency).
+* The ghost format carries a `certael_envelope`.
+
+**Certael** (`certael.windows.template_debug.x86_64.dll`,
+`certael_agent_probe.dll`): signed build manifest, policy and grant,
+launch through a "Certael Agent", session signing and revocation. This
+research did not test, bypass, or interfere with it.
+
+## 8. Recommendations
+
+For the developers, if they want to harden the client as well (optional —
+the server-side replay already addresses competitive impact):
+
+1. **Treat the replay verifier as the source of truth** (already the
+   design) and make sure every leaderboard or public submission goes
+   through `--verify`, not only `--validate`.
+2. **Make the replay check strict (F-4).** Count the snaps and the total
+   snapped distance, and fail or flag the run above a small budget. Check
+   more often than every 120 ticks. Better still, never snap to client data:
+   if stock re-simulation from inputs alone does not reach the finish, the
+   run is not valid.
+3. **Do not re-apply mutable "original" values each tick.** Capture
+   `_original_col_pos_y` / `_original_col_height` once as constants, or check
+   them against the scene's value before using them (F-2).
+4. **Cheap client integrity check.** Hash the `PlayerMovementData` fields at
+   load time and check the hash at random intervals or at run start/finish.
+   Mark the run unverifiable on mismatch. This catches F-1 locally and gives
+   the player clear feedback before they submit.
+5. **Flag impossible tuning in the ghost metadata** (for example
+   `gravity_scale_base == 0`) so the backend can reject a run before it
+   re-simulates it.
+
+Item 2 is the important one: it is the only one that does not trust the
+client. Items 3–5 do not stop a determined local attacker on an open PC.
+They move detection earlier and make the result clear to the player.
+
+## 9. Research method
+
+1. **Unpack.** `ivme.pck` is a standard Godot 4 pack: a header, a directory
+   (path, offset, size), then the file data. A short Python script extracts
+   single files.
+2. **Decompile.** The `.gdc` files are compiled GDScript.
+   [GDRE Tools](https://github.com/GDRETools/gdsdecomp) v2.7.4 decompiles them
+   with `--bytecode=4.5.0`, because auto-detect fails on this build.
+3. **Dump defaults.** The Godot 4.7 editor loaded
+   `player_movement_data.tres` and exported all 54 fields in declaration
+   order → `movement_data.json`.
+4. **Find native offsets.** A minimal Godot project was exported to a
+   `.pck` and run headless under a **copy** of `ivme.exe` in a temporary
+   folder, so the native layout matches the game exactly. Changing one
+   property at a time and diffing object memory gave
+   `script_instance +0x68`, `members +0x50`, `parent +0x100` and
+   `velocity +0x550`. The same probe confirmed N-1 (body stays on the floor)
+   and F-2 (body falls through the floor).
+5. **Map the input layer.** The input map in `project.binary` was parsed to
+   pick PoC hotkeys the game does not bind (number keys, `C`; the game uses
+   W/A/S/D, Space, Shift, Ctrl, E, Q, R, G, P, Y, Z, X, Esc, Alt, Home, F3, F5).
+6. **Live testing.** Only against a local, offline session. No public run
+   was submitted.
+
+## 10. Test environment and evidence
+
+* Windows 11 x64, IVME 0.17.10.0 (Steam), Python 3.x, Godot 4.7.2 editor,
+  GDRE Tools 2.7.4.
+* **Offline unit tests** — [`test_trainer_logic.py`](test_trainer_logic.py)
+  builds fake players, shapes, bodies and movement states in a fake memory
+  backend. It covers: the signature, player detection, ghost exclusion,
+  noclip capture and restore, fly writes to both state and body (horizontal
+  velocity unchanged), choosing the simulating instance, refusing stale
+  pointers, and intensity scaling. Result: `ALL TRAINER LOGIC TESTS PASSED`.
+* **Live checks** (game responsive throughout):
+  * F-1: `--set max_speed=5.5` → `OK`; presets → `OK`; a rescan shows the
+    changed values; `--restore` → all stock.
+  * F-2: noclip on → slot 55 reads `1000.0`; off → `0.0`; `OK`.
+  * F-3: the cadence table above.
+  * Freed-memory hazard (F-1) reproduced with `--full-scan`, then fixed.
+
+## 11. Limitations
+
+* **Assumed, not observed:** that the backend runs `--verify` on every
+  submitted run. Only the client-side code was examined. No run was
+  submitted to test this or F-4.
+* Native offsets belong to this exact Godot `template_debug` build. If an
+  update rebuilds it, the PoC refuses to write (its checks fail) until the
+  offsets are found again.
+* If the developers change the movement values, update the defaults in
+  `movement_data.json` so the signature still matches.
+* Only 0.17.10.0 on Windows x64 was tested.
+
+## 12. Timeline
+
+| Date | Event |
+| --- | --- |
+| 2026-10-17 | PCK unpacked, scripts decompiled, movement data dumped |
+| 2026-10-17 | F-1 confirmed live; freed-memory hazard found and fixed |
+| 2026-10-17 | N-1 negative result; F-2 confirmed in probe and live |
+| 2026-10-17 | F-3 state-only write lost; fixed by writing the body too |
+| 2026-10-17 | F-3 timing fix (50 ms → 4 ms); measured 0–5 % → 99–100 % |
+| 2026-10-17 | F-4 found by reading `headless_verifier.gd` (not tested) |
+| 2026-10-17 | Advisory written (private) |
+
+## 13. Using the PoC trainer
+
+> **Offline / practice only.** Do not submit runs made with any of this
+> active. Noclip and fly in particular fail the replay check, and Certael
+> may flag the session.
+
+Start the game, load into a level, then:
+
+```powershell
+python ivme_trainer.py
 ```
 
 | Key (number row or numpad) | Action |
@@ -30,226 +473,40 @@ python ivme_trainer.py                      # interactive hotkey mode
 | **2** | toggle jump preset |
 | **3** | toggle fly (Space = up, C = down, release = hover) |
 | **4** | toggle noclip (fly + no collision) |
-| **+** / **-** | cheat intensity up / down (0.25x – 4x) |
-| **9** | rescan memory (after a level load, if something stops working) |
+| **+** / **-** | intensity up / down (0.25x – 4x; scales presets and fly speed) |
+| **9** | rescan memory |
 | **0** | restore everything to stock |
 | **END** | restore and quit |
 
-IVME binds none of these keys (checked against the input map in
-`project.binary`). Keys only work while the **IVME window is in front**, so
-typing in Discord or a browser never toggles anything. They do still fire
-while you type in the in-game chat — press the key again or press **0** if
-you hit one by accident. **Ctrl+C** in the trainer's console also restores
-and quits.
+* Keys only work while the **IVME window is in front**. They still fire
+  while you type in the in-game chat — press the key again or press **0**.
+* **Ctrl+C** in the console also restores and quits.
+* Intensity: at `1x` you get the preset value; at `2x` the value goes twice
+  as far past stock (`max_speed 5.0 → 10.0` instead of `7.5`).
+* Presets and restore never touch fields the game sets itself
+  (`respawn_position`, mouse and controller sensitivity).
+* Keep this folder **outside** the game install before any verified
+  session. A signed build manifest may hash the install folder.
 
 One-shot commands:
 
 ```powershell
-python ivme_trainer.py --scan-only          # find arrays + players, print values
-python ivme_trainer.py --set max_speed=7.5  # patch one field, verify, exit
+python ivme_trainer.py --scan-only
+python ivme_trainer.py --set max_speed=7.5 --set jump_velocity=5.2
 python ivme_trainer.py --preset speed --intensity 2
-python ivme_trainer.py --restore            # stock values + collision back on
-python ivme_trainer.py --fly                # interactive, fly starts ON
-python ivme_trainer.py --noclip             # interactive, noclip starts ON
-python test_trainer_logic.py                # offline tests, no game needed
+python ivme_trainer.py --restore
+python ivme_trainer.py --fly
+python ivme_trainer.py --noclip
+python test_trainer_logic.py
 ```
 
-Requirements: Windows x64, Python 3.10+, no third-party packages. Run as
-administrator if `OpenProcess` fails.
+Windows x64, Python 3.10+, no third-party packages. Run as administrator if
+`OpenProcess` fails.
 
----
+## 14. Files
 
-## The writeup
-
-### 1. Looking inside the game
-
-IVME is a Godot 4.7 game. Everything lives in `ivme.pck`. The PCK format is
-simple: a header, a file directory (path, offset, size), and the file data.
-A few lines of Python list and extract any file from it.
-
-The scripts are compiled GDScript (`.gdc`). [GDRE Tools](https://github.com/GDRETools/gdsdecomp)
-decompiles them. The game's bytecode is not auto-detected, but forcing
-`--bytecode=4.5.0` works. The interesting scripts were:
-
-* `scripts/player/player_movement_data.tres` — every movement constant.
-* `scripts/player/movement_model.gd` — the movement simulation
-  (`pre_move` / `post_move`, `_enforce_speed_caps`, jumps, walljumps,
-  slides) at a 120 Hz physics rate.
-* `scripts/PlayerController.gd` and `scripts/player/player_body.gd` — the
-  player node, its collision shape, and its movement state.
-* `scripts/headless_verifier.gd` — the server-side replay check (see below).
-
-### 2. The movement data
-
-All tuning sits in one resource, `PlayerMovementData`, with 54 script
-variables: `max_speed=5.0`, `accel=20`, `air_accel=20`, `friction=8`,
-`jump_velocity=4`, `gravity_scale_base=1.2`, `air_speed_cap_multiplier=1.03`,
-`per_bhop_cap_increase=1`, `max_air_cap_bonus=5`, `base_fov=95`, and so on.
-The stock values were dumped with the Godot 4.7 editor into
-[`movement_data.json`](movement_data.json), which also holds the presets.
-
-Because `movement_model.gd` reads every constant from this one resource,
-changing it changes speed caps, bhop scaling, jumps, walljumps and slides
-all at once.
-
-### 3. Finding it in memory
-
-At runtime, a GDScript instance stores its variables as a contiguous array
-of Godot `Variant`s. On x86_64 each `Variant` is 24 bytes: a 4-byte type id,
-then the payload at `+8`. A `FLOAT` variant holds a `double`.
-
-So the 54 movement variables are a `Variant[54]` with a very distinctive
-pattern of doubles. The trainer:
-
-1. Walks the private read/write heap pages (skipping images and mapped
-   files cuts a multi-GB scan down to ~2–3 seconds).
-2. Searches for `95.0` (`base_fov`, a value no preset touches) as an anchor.
-3. Checks 24 slots around it: all must be `FLOAT`, finite, and sane, and at
-   least 16 must still equal stock. That last rule means a rescan still
-   works while a preset is active.
-
-There are no static offsets, so ASLR and most game patches do not break it.
-The game keeps several copies (cached resource, local player, replay ghost,
-menu instances), so every write goes to **every** copy and is verified by
-reading it back.
-
-**Bug found on the way:** an early scan hit was later freed and reused by
-the game for other data. Writing to it would have corrupted random memory.
-Now every address is re-validated against the signature right before any
-read or write.
-
-### 4. Speed and jump presets
-
-These are just writes into the movement array. Each preset in
-`movement_data.json` is scaled by an **intensity** multiplier: at `1x` you get
-the preset value; at `2x` the value goes twice as far past stock
-(`max_speed 5.0 → 10.0` instead of `7.5`).
-
-Fields the game sets itself at runtime (`respawn_position`, mouse and
-controller sensitivity) are never touched by presets or restore.
-
-### 5. From the movement array to the player
-
-Some scan hits are not the bare resource but a `PlayerController` instance.
-Its variable array is longer (94 slots): the 54 movement fields, then
-runtime state. A fixed pattern of variant types identifies it, and two of
-those slots are object references:
-
-* slot 84 → `col_shape` (the `CollisionShape3D`)
-* slot 87 → `_movement_state` (holds the player's `velocity`)
-
-Following a Godot object reference to its script variables goes
-`Object → script_instance (+0x68) → members array (+0x50)`. Those offsets,
-plus `Node::parent (+0x100)` and `CharacterBody3D::velocity (+0x550)`, were
-found with a probe: a tiny Godot project exported as a `.pck` and run under
-a **copy** of `ivme.exe`, so the native layout is exactly the game's.
-Toggling one property at a time and diffing object memory reveals each
-offset.
-
-Every pointer in the chain is sanity-checked (heap range, alignment, vtable
-in the executable's range, expected variant types). If anything looks wrong,
-the trainer skips that player instead of writing.
-
-### 6. Noclip — the first idea did not work
-
-The obvious approach is to set `CollisionShape3D.disabled = true` in memory.
-The probe showed it does **nothing**: the physics server only learns about a
-change through the property setter, and a raw memory write skips the setter.
-The probe body kept resting on its floor with `disabled = true`.
-
-The trick that works is in IVME's own code. Every physics tick,
-`_handle_slide_crouch` runs:
-
-```gdscript
-col_shape.position.y = _original_col_pos_y
-```
-
-That is a real setter call. So the trainer writes `_original_col_pos_y`
-(player slot 55) to `1000.0`, and the game itself moves the collision shape
-1000 units up into empty sky. The body no longer touches anything. In the
-probe, the body fell straight through the floor. On toggle-off the captured
-original value (stock `0.0`) is written back.
-
-### 7. Fly — fighting the engine for the velocity
-
-Fly zeroes `gravity_scale_base` / `gravity_scale_max` and holds the
-vertical velocity at a target (Space = `+8 × intensity`, C = `-8 × intensity`,
-nothing = `0`, so you hover).
-
-The first version wrote only `_movement_state.velocity.y`, and it barely
-worked. The reason: at the start of each tick, the movement code copies the
-**native** `CharacterBody3D.velocity` into the state, which wiped the write.
-The fix follows the collision shape's parent pointer to the body and writes
-the velocity in **both** places.
-
-That was still jumpy, because of timing. The game runs physics at 120 Hz
-(one tick every ~8.3 ms) and resets the velocity on each tick, but the
-trainer only wrote every 50 ms — so most ticks ran with the game's own
-value. While fly is on, the trainer now writes every ~4 ms. Measured live:
-
-| Write interval | Ticks holding the target velocity |
+| File | Purpose |
 | --- | --- |
-| 50 ms (old) | 0–5 % |
-| 4 ms (new) | 99–100 % |
-
-It also writes **only** the Y float now. Rewriting all three components
-could put back a stale horizontal velocity if a tick landed between the
-read and the write.
-
-**Picking the right player.** The game often has several
-`PlayerController` instances that all look controllable (menus, leftover
-scenes). Only the real one advances `state.physics_time` every frame. The
-trainer samples it twice, 150 ms apart, and drives the one that moves. It
-re-checks this every ~2 seconds (without pausing the fly writes), and
-re-acquires all pointers when a level load replaces the player.
-
-### 8. Testing
-
-* `test_trainer_logic.py` builds fake players, shapes, bodies and movement
-  states in a fake memory backend and tests the signature, player
-  detection, noclip capture/restore, fly velocity writes (state **and**
-  native), primary-player selection, stale-pointer refusal, and intensity
-  scaling.
-* Live checks were done against the running game: presets, intensity, fly
-  up / hover, noclip on / off, and restore all reported `OK` and read back
-  correctly, with the game responsive throughout. The fly table above
-  came from the same kind of live check.
-
----
-
-## Public runs and anti-cheat
-
-* **Runs are replay-verified.** `headless_verifier.gd` re-simulates your
-  recorded inputs with stock movement data (`MAX_VALIDATE_H_SPEED = 24`,
-  `TELEPORT_DISTANCE = 2.0`, `FINAL_POSITION_TOLERANCE = 2.0`, plus desync
-  tolerances). Any change to your path desyncs it. Fly and noclip are the
-  most obvious cases. Expect such runs to be rejected.
-* **Certael attestation ships with the game**
-  (`certael.windows.template_debug.x86_64.dll`, `certael_agent_probe.dll`):
-  signed build manifest, launch through a "Certael Agent", session signing
-  and revocation. This trainer does **not** bypass, hide from, or interfere
-  with any of it.
-* Keep the trainer folder **outside** the game install before any verified
-  session — a signed build manifest may hash the install tree.
-
-Use it to practice and to learn how the movement model behaves at other
-tunings. Do not use it for public or verified runs.
-
-## Limits
-
-* Native offsets (`+0x68`, `+0x50`, `+0x100`, `+0x550`) belong to this exact
-  Godot template build. If an update rebuilds it, fly and noclip will refuse
-  to write (the sanity checks fail) until the offsets are found again.
-* If the developers retune movement, update the defaults in
-  `movement_data.json` so the signature still matches.
-
-## Files
-
-* `ivme_trainer.py` — the trainer (attach, scan, patch, fly / noclip, hotkeys).
-* `movement_data.json` — field order, stock defaults, preset definitions.
-* `test_trainer_logic.py` — offline tests against a fake memory backend.
-
-## Disclaimer
-
-Not affiliated with DDPWorks. No game code or assets are included in this
-repository. For personal, offline use.
+| `ivme_trainer.py` | PoC: attach, scan, patch, fly / noclip, hotkeys |
+| `movement_data.json` | field order, stock defaults, preset definitions |
+| `test_trainer_logic.py` | offline tests against a fake memory backend |
