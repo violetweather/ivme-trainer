@@ -49,6 +49,7 @@ Usage
       +/- cheat intensity up/down    9    rescan
       0   restore everything         END  quit (restores first)
       (number row or numpad; IVME binds none of these keys)
+      Keys only work while the IVME window is in front. Ctrl+C also quits.
       While flying: Space = up, C = down (speed scales with intensity)
 
 WARNING: IVME verifies public runs by re-simulating your recorded inputs
@@ -588,19 +589,15 @@ class Trainer:
 
         do_movement copies native body velocity into the state at the start
         of every physics tick, so writing only the state is usually lost;
-        writing both makes the value stick deterministically.
+        writing both makes the value stick deterministically. Only the Y
+        float (+4) is written, so a tick landing between our read and write
+        can't get its horizontal velocity overwritten with stale values.
         """
         ok = False
-        vel = self.read_velocity(player)
-        if vel is not None:
-            ok = self.mem.write(player.velocity_addr,
-                                struct.pack("<3f", vel[0], vel_y, vel[2]))
-        if player.native_velocity_addr:
-            raw = self.mem.read(player.native_velocity_addr, 12)
-            if raw:
-                nx, _, nz = struct.unpack("<3f", raw)
-                ok = self.mem.write(player.native_velocity_addr,
-                                    struct.pack("<3f", nx, vel_y, nz)) or ok
+        y = struct.pack("<f", vel_y)
+        for addr in (player.velocity_addr, player.native_velocity_addr):
+            if addr and self.mem.read(addr, 12) is not None:
+                ok = self.mem.write(addr + 4, y) or ok
         return ok
 
     # Fields the game itself rewrites at runtime (spawn placement, user
@@ -694,6 +691,23 @@ def key_pressed(vk: int) -> bool:
     return bool(u32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def foreground_pid() -> int:
+    hwnd = u32.GetForegroundWindow()
+    if not hwnd:
+        return 0
+    pid = wt.DWORD(0)
+    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
+# While fly/noclip is on, re-assert velocity.y this often. The game ticks
+# at 120 Hz (~8.3 ms) and resets velocity each tick, so a 50 ms cadence
+# lost most ticks; ~4 ms catches nearly all of them.
+FLY_WRITE_INTERVAL = 0.004
+IDLE_POLL_INTERVAL = 0.05
+REVALIDATE_INTERVAL = 2.0
+
+
 def hotkey_loop(trainer: Trainer, intensity: float = 1.0,
                 start_fly: bool = False, start_noclip: bool = False):
     data = trainer.data
@@ -702,16 +716,24 @@ def hotkey_loop(trainer: Trainer, intensity: float = 1.0,
     players: list[PlayerRef] = []
     prev: dict[int, bool] = {}
     intensity = clamp_intensity(intensity)
-    tick = 0
+    game_pid = trainer.mem.pid
+    focus = {"game": False}
+    last_check = {"at": time.monotonic(), "physics_time": None}
+
+    def key_down(vk: int) -> bool:
+        # Keys only count while the game window is in front, so typing in
+        # Discord/browser/etc. never toggles cheats.
+        return focus["game"] and key_pressed(vk)
 
     def edge(vk: int) -> bool:
-        now = key_pressed(vk)
+        now = key_down(vk)
         was = prev.get(vk, False)
         prev[vk] = now
         return now and not was
 
     def edge_any(vks) -> bool:
-        return any(edge(vk) for vk in vks)
+        # Evaluate every key so each one's previous state stays current.
+        return any([edge(vk) for vk in vks])
 
     def merged_values() -> dict:
         # Only fields some preset owns: active presets win (scaled by
@@ -792,6 +814,8 @@ def hotkey_loop(trainer: Trainer, intensity: float = 1.0,
     print("Hotkeys: 1=speed  2=jump  3=fly  4=noclip  +/-=intensity  "
           "9=rescan  0=restore  END=quit | flying: Space=up, C=down",
           flush=True)
+    print("(keys only work while the IVME window is in front; "
+          "Ctrl+C here also restores and quits)", flush=True)
     refresh_players()
     for p in players:
         print(f"  {p.describe()}", flush=True)
@@ -802,81 +826,95 @@ def hotkey_loop(trainer: Trainer, intensity: float = 1.0,
     if start_noclip:
         set_noclip(True)
 
-    while True:
-        tick += 1
-        if edge(VK_END):
-            print("Restoring defaults and exiting...", flush=True)
-            restore_all()
-            return
-        if edge_any(KEYS_RESTORE):
-            print("Restore:", "OK" if restore_all() else "FAILED", flush=True)
-        if edge_any(KEYS_RESCAN):
-            hits = trainer.rescan()
+    def revalidate() -> None:
+        # Level loads recreate the player instance, leaving our pointers
+        # stale. Also switch target if another instance is the one actually
+        # simulating. Non-blocking: compares physics_time with the value
+        # seen at the previous check instead of sleeping.
+        current = primary_player()
+        now_pt = trainer.read_physics_time(current) if current else None
+        prev_pt = last_check["physics_time"]
+        last_check["physics_time"] = now_pt
+        if (current is not None and len(local_players()) > 1
+                and now_pt is not None and prev_pt is not None
+                and now_pt - prev_pt <= 0.001):
+            better = trainer.select_primary(players)
+            if better is not None and better.segment != current.segment:
+                primary[0] = better
+                last_check["physics_time"] = None
+                print(f"Switched fly target to simulating player "
+                      f"@0x{better.segment:X}", flush=True)
+        stale = [p for p in local_players()
+                 if not trainer._player_still_valid(p)
+                 or trainer.read_velocity(p) is None]
+        if stale or not local_players():
+            trainer.rescan()
             refresh_players()
-            print(f"Rescan: {len(hits)} array(s), {len(players)} player(s) found",
-                  flush=True)
-            if hits and (any(active.values()) or state["fly"] or state["noclip"]):
-                trainer.apply(merged_values())
+            last_check["physics_time"] = None
+            trainer.apply(merged_values())
             if state["noclip"]:
                 trainer.set_shape_displaced(players, displaced=True)
-        for vks, pname in ((KEYS_SPEED, "speed"), (KEYS_JUMP, "jump")):
-            if pname in data.presets and edge_any(vks):
-                active[pname] = not active[pname]
-                ok = trainer.apply(merged_values())
-                print(f"Preset '{pname}' {'ON' if active[pname] else 'OFF'} "
-                      f"(intensity {intensity:g}x): {'OK' if ok else 'FAILED'}",
-                      flush=True)
-        if edge_any(KEYS_FLY):
-            set_fly(not state["fly"])
-        if edge_any(KEYS_NOCLIP):
-            set_noclip(not state["noclip"])
-        plus_edge = edge_any(VK_PLUS_KEYS)
-        minus_edge = edge_any(VK_MINUS_KEYS)
-        if plus_edge or minus_edge:
-            intensity = clamp_intensity(
-                intensity + INTENSITY_STEP if plus_edge
-                else intensity - INTENSITY_STEP)
-            print(f"Intensity: {intensity:g}x (fly speed {BASE_FLY_SPEED * intensity:g})",
+            print(f"Re-acquired {len(players)} player(s) after stale pointers",
                   flush=True)
-            if any(active.values()) or state["fly"] or state["noclip"]:
-                trainer.apply(merged_values())
 
-        # Fly/noclip vertical control: hold velocity.y at the target so the
-        # movement model's gravity (zeroed) and jump logic can't drift it.
-        if state["fly"] or state["noclip"]:
-            speed = BASE_FLY_SPEED * intensity
-            target_y = (speed if key_pressed(VK_SPACE) else 0.0) \
-                + (-speed if key_pressed(VK_C) else 0.0)
-            target = primary_player()
-            if target:
-                trainer.write_velocity_y(target, target_y)
-            # Periodically re-validate: level loads recreate the player
-            # instance, leaving our pointers stale. Also switch primary if
-            # a different instance is the one actually simulating.
-            if tick % 40 == 0:
-                current = primary_player()
-                if current is not None and len(local_players()) > 1:
-                    before = trainer.read_physics_time(current)
-                    time.sleep(0.1)
-                    after = trainer.read_physics_time(current)
-                    if before is not None and after is not None and after - before <= 0.001:
-                        better = trainer.select_primary(players)
-                        if better is not None and better.segment != current.segment:
-                            primary[0] = better
-                            print(f"Switched fly target to simulating player "
-                                  f"@0x{better.segment:X}", flush=True)
-                stale = [p for p in local_players()
-                         if not trainer._player_still_valid(p)
-                         or trainer.read_velocity(p) is None]
-                if stale or not local_players():
-                    trainer.rescan()
-                    refresh_players()
+    try:
+        while True:
+            focus["game"] = foreground_pid() == game_pid
+            if edge(VK_END):
+                print("Restoring defaults and exiting...", flush=True)
+                restore_all()
+                return
+            if edge_any(KEYS_RESTORE):
+                print("Restore:", "OK" if restore_all() else "FAILED", flush=True)
+            if edge_any(KEYS_RESCAN):
+                hits = trainer.rescan()
+                refresh_players()
+                print(f"Rescan: {len(hits)} array(s), {len(players)} player(s) found",
+                      flush=True)
+                if hits and (any(active.values()) or state["fly"] or state["noclip"]):
                     trainer.apply(merged_values())
-                    if state["noclip"]:
-                        trainer.set_shape_displaced(players, displaced=True)
-                    print(f"Re-acquired {len(players)} player(s) after stale pointers",
+                if state["noclip"]:
+                    trainer.set_shape_displaced(players, displaced=True)
+            for vks, pname in ((KEYS_SPEED, "speed"), (KEYS_JUMP, "jump")):
+                if pname in data.presets and edge_any(vks):
+                    active[pname] = not active[pname]
+                    ok = trainer.apply(merged_values())
+                    print(f"Preset '{pname}' {'ON' if active[pname] else 'OFF'} "
+                          f"(intensity {intensity:g}x): {'OK' if ok else 'FAILED'}",
                           flush=True)
-        time.sleep(0.05)
+            if edge_any(KEYS_FLY):
+                set_fly(not state["fly"])
+            if edge_any(KEYS_NOCLIP):
+                set_noclip(not state["noclip"])
+            plus_edge = edge_any(VK_PLUS_KEYS)
+            minus_edge = edge_any(VK_MINUS_KEYS)
+            if plus_edge or minus_edge:
+                intensity = clamp_intensity(
+                    intensity + INTENSITY_STEP if plus_edge
+                    else intensity - INTENSITY_STEP)
+                print(f"Intensity: {intensity:g}x (fly speed {BASE_FLY_SPEED * intensity:g})",
+                      flush=True)
+                if any(active.values()) or state["fly"] or state["noclip"]:
+                    trainer.apply(merged_values())
+
+            # Fly/noclip vertical control: hold velocity.y at the target so
+            # the movement model's gravity (zeroed) and jump logic can't
+            # drift it. Out of focus, Space/C read as released -> hover.
+            flying = state["fly"] or state["noclip"]
+            if flying:
+                speed = BASE_FLY_SPEED * intensity
+                target_y = (speed if key_down(VK_SPACE) else 0.0) \
+                    + (-speed if key_down(VK_C) else 0.0)
+                target = primary_player()
+                if target:
+                    trainer.write_velocity_y(target, target_y)
+                if time.monotonic() - last_check["at"] >= REVALIDATE_INTERVAL:
+                    last_check["at"] = time.monotonic()
+                    revalidate()
+            time.sleep(FLY_WRITE_INTERVAL if flying else IDLE_POLL_INTERVAL)
+    except KeyboardInterrupt:
+        print("Ctrl+C: restoring defaults and exiting...", flush=True)
+        restore_all()
 
 
 def parse_set_args(items: list[str], data: MovementData) -> dict:

@@ -36,8 +36,11 @@ python ivme_trainer.py                      # interactive hotkey mode
 | **END** | restore and quit |
 
 IVME binds none of these keys (checked against the input map in
-`project.binary`). The hotkeys still fire while you type in chat — press the
-key again or press **0** if you hit one by accident.
+`project.binary`). Keys only work while the **IVME window is in front**, so
+typing in Discord or a browser never toggles anything. They do still fire
+while you type in the in-game chat — press the key again or press **0** if
+you hit one by accident. **Ctrl+C** in the trainer's console also restores
+and quits.
 
 One-shot commands:
 
@@ -177,15 +180,28 @@ The first version wrote only `_movement_state.velocity.y`, and it barely
 worked. The reason: at the start of each tick, the movement code copies the
 **native** `CharacterBody3D.velocity` into the state, which wiped the write.
 The fix follows the collision shape's parent pointer to the body and writes
-the velocity in **both** places. In a live test the velocity then held at
-the target on most 50 ms samples, which is enough for smooth flight.
+the velocity in **both** places.
+
+That was still jumpy, because of timing. The game runs physics at 120 Hz
+(one tick every ~8.3 ms) and resets the velocity on each tick, but the
+trainer only wrote every 50 ms — so most ticks ran with the game's own
+value. While fly is on, the trainer now writes every ~4 ms. Measured live:
+
+| Write interval | Ticks holding the target velocity |
+| --- | --- |
+| 50 ms (old) | 0–5 % |
+| 4 ms (new) | 99–100 % |
+
+It also writes **only** the Y float now. Rewriting all three components
+could put back a stale horizontal velocity if a tick landed between the
+read and the write.
 
 **Picking the right player.** The game often has several
 `PlayerController` instances that all look controllable (menus, leftover
 scenes). Only the real one advances `state.physics_time` every frame. The
 trainer samples it twice, 150 ms apart, and drives the one that moves. It
-re-checks this every ~2 seconds, and re-acquires all pointers when a level
-load replaces the player.
+re-checks this every ~2 seconds (without pausing the fly writes), and
+re-acquires all pointers when a level load replaces the player.
 
 ### 8. Testing
 
@@ -196,7 +212,8 @@ load replaces the player.
   scaling.
 * Live checks were done against the running game: presets, intensity, fly
   up / hover, noclip on / off, and restore all reported `OK` and read back
-  correctly, with the game responsive throughout.
+  correctly, with the game responsive throughout. The fly table above
+  came from the same kind of live check.
 
 ---
 
