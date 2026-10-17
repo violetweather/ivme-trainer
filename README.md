@@ -1,9 +1,5 @@
 # IVME-ADV-2026-001 — Client-side movement state is externally writable (speed, jump, fly, noclip)
 
-> **Unofficial advisory.** This is a personal research writeup in the style
-> of a CVE entry. No CVE has been requested or assigned. Not affiliated with
-> DDPWorks. No game code or assets are included in this repository.
-
 | Field | Value |
 | --- | --- |
 | **Advisory ID** | IVME-ADV-2026-001 (unofficial) |
@@ -15,7 +11,7 @@
 | **CVSS v3.1** | **3.3 Low** — `CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:N` |
 | **Attack type** | Local, same-user process memory read/write (`ReadProcessMemory` / `WriteProcessMemory`) |
 | **Mitigated by** | Headless replay verifier shipped in the game — partly; see [§7](#7-existing-mitigations) and [F-4](#f-4-replay-verifier-snaps-instead-of-failing-on-moderate-drift) |
-| **Reported** | Not reported. Private research. |
+| **Reported** | Not reported to the developer before publication. |
 | **Date** | 2026-10-17 |
 | **Researcher** | [@violetweather](https://github.com/violetweather) |
 
@@ -453,7 +449,7 @@ They move detection earlier and make the result clear to the player.
 | 2026-10-17 | F-3 state-only write lost; fixed by writing the body too |
 | 2026-10-17 | F-3 timing fix (50 ms → 4 ms); measured 0–5 % → 99–100 % |
 | 2026-10-17 | F-4 found by reading `headless_verifier.gd` (not tested) |
-| 2026-10-17 | Advisory written (private) |
+| 2026-10-17 | Advisory written and published |
 
 ## 13. Using the PoC trainer
 
