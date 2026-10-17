@@ -1,0 +1,82 @@
+{
+  "comment": "PlayerMovementData script variables in declaration order (index = Variant array slot). Defaults dumped from player_movement_data.tres in ivme.pck v0.17.10.0 via Godot 4.7. type f = Variant FLOAT (double), v2/v3 = float components.",
+  "game_version": "0.17.10.0",
+  "fields": [
+    {"name": "max_speed", "type": "f", "default": 5.0},
+    {"name": "accel", "type": "f", "default": 20.0},
+    {"name": "air_accel", "type": "f", "default": 20.0},
+    {"name": "friction", "type": "f", "default": 8.0},
+    {"name": "jump_velocity", "type": "f", "default": 4.0},
+    {"name": "gravity_scale_base", "type": "f", "default": 1.2},
+    {"name": "gravity_scale_max", "type": "f", "default": 2.4},
+    {"name": "coyote_time", "type": "f", "default": 0.12},
+    {"name": "jump_buffer_time", "type": "f", "default": 0.12},
+    {"name": "mouse_sensitivity", "type": "v2", "default": [0.12, 0.12]},
+    {"name": "controller_sensitivity", "type": "v2", "default": [0.5, 0.5]},
+    {"name": "controller_look_deadzone", "type": "f", "default": 0.2},
+    {"name": "ground_accel_scale", "type": "f", "default": 1.5},
+    {"name": "jump_speed_bonus", "type": "f", "default": 2.0},
+    {"name": "air_speed_cap_multiplier", "type": "f", "default": 1.03},
+    {"name": "ground_brake", "type": "f", "default": 45.0},
+    {"name": "air_brake", "type": "f", "default": 45.0},
+    {"name": "landed_decay_rate", "type": "f", "default": 2.0},
+    {"name": "air_overspeed_decay_rate", "type": "f", "default": 3.0},
+    {"name": "respawn_position", "type": "v3", "default": [0.0, 0.031, 0.0]},
+    {"name": "respawn_y_threshold", "type": "f", "default": -10.0},
+    {"name": "per_bhop_cap_increase", "type": "f", "default": 1.0},
+    {"name": "max_air_cap_bonus", "type": "f", "default": 5.0},
+    {"name": "bhop_apply_threshold", "type": "f", "default": 0.1},
+    {"name": "walljump_distance", "type": "f", "default": 1.42},
+    {"name": "spray_cooldown_time", "type": "f", "default": 5.0},
+    {"name": "walljump_base_y", "type": "f", "default": 5.0},
+    {"name": "walljump_forward_scale", "type": "f", "default": 3.5},
+    {"name": "walljump_normal_dot_thresh", "type": "f", "default": 0.4},
+    {"name": "walljump_cam_dot_thresh", "type": "f", "default": 0.3},
+    {"name": "wall_min_angle_from_up_deg", "type": "f", "default": 45.0},
+    {"name": "wall_min_rotation_diff_deg", "type": "f", "default": 64.0},
+    {"name": "walljump_fall_comp_thresh", "type": "f", "default": 1.0},
+    {"name": "walljump_fall_comp_max", "type": "f", "default": 6.0},
+    {"name": "base_fov", "type": "f", "default": 95.0},
+    {"name": "max_extra_fov", "type": "f", "default": 22.0},
+    {"name": "lean_max_angle", "type": "f", "default": 5.0},
+    {"name": "lean_speed", "type": "f", "default": 8.0},
+    {"name": "squash_intensity", "type": "f", "default": 0.06},
+    {"name": "squash_max", "type": "f", "default": 0.2},
+    {"name": "squash_look_intensity", "type": "f", "default": 1.5},
+    {"name": "squash_look_max", "type": "f", "default": 10.0},
+    {"name": "squash_recovery_speed", "type": "f", "default": 12.0},
+    {"name": "squash_fall_threshold", "type": "f", "default": 6.0},
+    {"name": "slide_duration", "type": "f", "default": 0.5},
+    {"name": "slide_slope_accel", "type": "f", "default": 15.0},
+    {"name": "crouch_height_multiplier", "type": "f", "default": 0.5},
+    {"name": "slide_steer_control", "type": "f", "default": 0.3},
+    {"name": "slide_spam_penalty", "type": "f", "default": 2.0},
+    {"name": "slide_jump_speed_scale", "type": "f", "default": 0.2},
+    {"name": "slide_jump_max_boost", "type": "f", "default": 3.5},
+    {"name": "slide_jump_grace_time", "type": "f", "default": 0.25},
+    {"name": "airjump_speed_scale", "type": "f", "default": 0.2},
+    {"name": "airjump_max_boost", "type": "f", "default": 3.5}
+  ],
+  "presets": {
+    "speed": {
+      "description": "Higher ground speed cap and bhop scaling",
+      "values": {
+        "max_speed": 7.5,
+        "ground_accel_scale": 2.0,
+        "air_speed_cap_multiplier": 1.08,
+        "per_bhop_cap_increase": 2.0,
+        "max_air_cap_bonus": 10.0
+      }
+    },
+    "jump": {
+      "description": "Higher jumps, floatier gravity, stronger walljump",
+      "values": {
+        "jump_velocity": 5.2,
+        "gravity_scale_base": 0.9,
+        "gravity_scale_max": 1.6,
+        "walljump_base_y": 6.5,
+        "walljump_forward_scale": 4.5
+      }
+    }
+  }
+}
